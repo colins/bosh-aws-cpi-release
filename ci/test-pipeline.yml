@@ -1,0 +1,329 @@
+---
+# Temporary test pipeline for branch: apply-tags-at-creation-time
+# Set with:
+#   fly -t <target> set-pipeline -p test-delete-when-finished-apply-tags-at-creation-time \
+#       -c ci/test-pipeline.yml
+# Destroy when done:
+#   fly -t <target> destroy-pipeline -p test-delete-when-finished-apply-tags-at-creation-time
+
+resource_types:
+- name: terraform_type
+  type: registry-image
+  source:
+    repository: ljfranklin/terraform-resource
+    username: ((dockerhub_username))
+    password: ((dockerhub_password))
+- name: gcs
+  type: registry-image
+  source:
+    repository: frodenas/gcs-resource
+    username: ((dockerhub_username))
+    password: ((dockerhub_password))
+
+resources:
+- name: bosh-aws-cpi-release
+  type: git
+  source:
+    uri: git@github.com:cloudfoundry/bosh-aws-cpi-release.git
+    branch: apply-tags-at-creation-time
+    private_key: ((github_deploy_key_bosh-aws-cpi-release.private_key))
+
+- name: light-stemcell
+  type: bosh-io-stemcell
+  source:
+    name: bosh-aws-xen-hvm-ubuntu-noble
+
+- name: bosh-integration-image
+  type: registry-image
+  source:
+    repository: ghcr.io/cloudfoundry/bosh/integration
+    tag: main
+    username: ((github_read_write_packages.username))
+    password: ((github_read_write_packages.password))
+
+- name: environment
+  type: terraform_type
+  source:
+    backend_type: gcs
+    backend_config:
+      bucket: bosh-aws-cpi-pipeline
+      # Separate prefix from the main pipeline's state to avoid conflicts
+      prefix: terraform-test-apply-tags-at-creation-time
+      credentials: ((gcp_json_key))
+    vars:
+      access_key: ((aws-admin.username))
+      secret_key: ((aws-admin.password))
+      region: us-west-1
+      public_key: ((integration_vm_keypair.public_key))
+      resource_prefix: awscpi
+
+- name: bosh-cpi-dev-artifacts
+  type: gcs
+  source:
+    versioned_file: bosh-aws-cpi-dev-release.tgz
+    bucket: bosh-aws-cpi-pipeline
+    json_key: ((gcp_json_key))
+
+- name: bosh-release
+  type: bosh-io-release
+  source:
+    repository: cloudfoundry/bosh
+
+- name: heavy-stemcell
+  type: bosh-io-stemcell
+  source:
+    name: bosh-aws-xen-hvm-ubuntu-noble
+    force_regular: true
+
+- name: bosh-deployment
+  type: git
+  source:
+    uri: https://github.com/cloudfoundry/bosh-deployment
+    branch: master
+
+- name: pipelines
+  type: git
+  source:
+    uri: https://github.com/cloudfoundry/bosh-cpi-certification
+    branch: master
+
+# Separate terraform state prefix so setup-e2e-env and teardown-e2e-env don't
+# conflict with the integration job's short-lived environment.
+- name: e2e-environment
+  type: terraform_type
+  source:
+    backend_type: gcs
+    backend_config:
+      bucket: bosh-aws-cpi-pipeline
+      prefix: terraform-test-e2e-apply-tags-at-creation-time
+      credentials: ((gcp_json_key))
+    vars:
+      access_key: ((aws-admin.username))
+      secret_key: ((aws-admin.password))
+      region: us-west-1
+      public_key: ((integration_vm_keypair.public_key))
+      resource_prefix: awscpi
+
+# Persists the director-state artifact (director.env + bbl state) between jobs
+# so setup-e2e-env only needs to run once.
+- name: e2e-director-state
+  type: gcs
+  source:
+    bucket: bosh-aws-cpi-pipeline
+    versioned_file: test-apply-tags-at-creation-time-director-state.tgz
+    json_key: ((gcp_json_key))
+
+jobs:
+- name: integration
+  serial: true
+  plan:
+  - in_parallel:
+    - get: bosh-aws-cpi-release
+      trigger: true
+    - get: stemcell
+      resource: light-stemcell
+      trigger: true
+    - get: bosh-integration-image
+  - put: environment
+    params:
+      env_name: bosh-aws-cpi-test-branch
+      delete_on_failure: true
+      generate_random_name: true
+      terraform_source: bosh-aws-cpi-release/ci/assets/terraform
+  - task: test
+    file: bosh-aws-cpi-release/ci/tasks/run-integration.yml
+    image: bosh-integration-image
+    params:
+      AWS_ACCESS_KEY_ID: ((aws-test-user.username))
+      AWS_SECRET_ACCESS_KEY: ((aws-test-user.password))
+      BOSH_AWS_PERMISSIONS_AUDITOR_KEY_ID: ((aws-permission-auditor.username))
+      BOSH_AWS_PERMISSIONS_AUDITOR_SECRET_KEY: ((aws-permission-auditor.password))
+      AWS_DEFAULT_REGION: us-west-1
+      BOSH_AWS_KMS_KEY_ARN: ((arn_keys.aws_kms_key_arn))
+      BOSH_AWS_KMS_KEY_ARN_OVERRIDE: ((arn_keys.aws_kms_key_arn_override))
+      BOSH_AWS_WINDOWS_IMAGE_ID: ami-01073c012a14da808
+      RSPEC_ARGUMENTS: spec/integration/spot_instance_spec.rb
+    ensure:
+      do:
+      - task: ensure-terminated
+        file: bosh-aws-cpi-release/ci/tasks/ensure-terminated.yml
+        image: bosh-integration-image
+        params:
+          AWS_ACCESS_KEY_ID: ((aws-admin.username))
+          AWS_SECRET_ACCESS_KEY: ((aws-admin.password))
+          AWS_DEFAULT_REGION: us-west-1
+      - put: environment
+        params:
+          env_name: bosh-aws-cpi-test-branch
+          action: destroy
+          env_name_file: environment/name
+          terraform_source: bosh-aws-cpi-release/ci/assets/terraform
+        get_params:
+          action: destroy
+
+
+# ─── E2E three-job split ──────────────────────────────────────────────────────
+# Run setup-e2e-env once to provision the VPC and deploy the BOSH director.
+# Then re-trigger run-e2e freely. Tear down with teardown-e2e-env when done.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: setup-e2e-env
+  serial: true
+  plan:
+  - in_parallel:
+    - get: cpi-release
+      resource: bosh-cpi-dev-artifacts
+    - get: bosh-release
+    - get: bosh-aws-cpi-release
+    - get: stemcell
+      resource: light-stemcell
+    - get: heavy-stemcell
+    - get: bosh-deployment
+    - get: pipelines
+    - get: bosh-integration-image
+  - put: e2e-environment
+    params:
+      env_name: bosh-aws-cpi-e2e-local
+      delete_on_failure: true
+      terraform_source: bosh-aws-cpi-release/ci/assets/terraform
+      override_files: [ bosh-aws-cpi-release/ci/assets/terraform/e2e/e2e.tf ]
+  - do:
+    - task: prepare-director
+      file: pipelines/shared/tasks/prepare-director.yml
+      image: bosh-integration-image
+      input_mapping:
+        environment: e2e-environment
+      params:
+        INFRASTRUCTURE: aws
+        DIRECTOR_VARS_FILE: |
+          access_key_id: ((aws-cpi-e2e-tests.username))
+          secret_access_key: ((aws-cpi-e2e-tests.password))
+          region: us-west-1
+        OPTIONAL_OPS_FILE: |
+          -o bosh-deployment/external-ip-with-registry-not-recommended.yml
+          -o pipelines/shared/assets/ops/remove-provider-cert.yml
+          -o pipelines/aws/assets/ops/iam-instance-profile-ops-file.yml
+    - task: deploy-director
+      file: pipelines/shared/tasks/deploy-director.yml
+      image: bosh-integration-image
+    - task: pack-director-state
+      image: bosh-integration-image
+      config:
+        platform: linux
+        inputs:
+        - name: director-state
+        outputs:
+        - name: packed
+        run:
+          path: bash
+          args: ["-c", "tar czf packed/state.tgz -C director-state ."]
+    - put: e2e-director-state
+      params:
+        file: packed/state.tgz
+    on_failure:
+      do:
+      - task: ensure-terminated
+        file: bosh-aws-cpi-release/ci/tasks/ensure-terminated.yml
+        image: bosh-integration-image
+        input_mapping:
+          environment: e2e-environment
+        params:
+          AWS_ACCESS_KEY_ID: ((aws-admin.username))
+          AWS_SECRET_ACCESS_KEY: ((aws-admin.password))
+          AWS_DEFAULT_REGION: us-west-1
+      - put: e2e-environment
+        params:
+          env_name: bosh-aws-cpi-e2e-local
+          action: destroy
+          env_name_file: e2e-environment/name
+          terraform_source: bosh-aws-cpi-release/ci/assets/terraform
+        get_params:
+          action: destroy
+
+- name: run-e2e
+  serial: true
+  plan:
+  - in_parallel:
+    - get: bosh-aws-cpi-release
+      trigger: true
+    - get: stemcell
+      resource: light-stemcell
+    - get: heavy-stemcell
+    - get: e2e-environment
+      passed: [setup-e2e-env]
+    - get: e2e-director-state
+      passed: [setup-e2e-env]
+    - get: bosh-integration-image
+  - task: unpack-director-state
+    image: bosh-integration-image
+    config:
+      platform: linux
+      inputs:
+      - name: e2e-director-state
+      outputs:
+      - name: director-state
+      run:
+        path: bash
+        args:
+        - -c
+        - |-
+          tar xzf e2e-director-state/test-apply-tags-at-creation-time-director-state.tgz -C director-state
+          # The director is exposed via its EIP on port 25555. Strip the SSH proxy vars
+          # so the BOSH CLI connects directly without needing a jumpbox user.
+          grep -v 'BOSH_ALL_PROXY\|private_key_path\|BOSH_GW_HOST\|BOSH_GW_USER\|BOSH_GW_PRIVATE_KEY' director-state/director.env \
+            > director-state/director.env.tmp
+          mv director-state/director.env.tmp director-state/director.env
+  - task: run-e2e
+    file: bosh-aws-cpi-release/ci/tasks/run-e2e.yml
+    image: bosh-integration-image
+    input_mapping:
+      environment: e2e-environment
+    params:
+      BOSH_AWS_KMS_KEY_ARN: ((arn_keys.aws_kms_key_arn))
+      IAM_USER: aws-cpi-e2e-tests
+      AWS_ACCESS_KEY_ID: ((aws-cpi-e2e-tests.username))
+      AWS_SECRET_ACCESS_KEY: ((aws-cpi-e2e-tests.password))
+
+- name: teardown-e2e-env
+  serial: true
+  plan:
+  - in_parallel:
+    - get: bosh-aws-cpi-release
+    - get: pipelines
+    - get: e2e-environment
+      passed: [setup-e2e-env]
+    - get: e2e-director-state
+      passed: [setup-e2e-env]
+    - get: bosh-integration-image
+  - task: unpack-director-state
+    image: bosh-integration-image
+    config:
+      platform: linux
+      inputs:
+      - name: e2e-director-state
+      outputs:
+      - name: director-state
+      run:
+        path: bash
+        args: ["-c", "tar xzf e2e-director-state/test-apply-tags-at-creation-time-director-state.tgz -C director-state"]
+  - try:
+      task: teardown
+      file: pipelines/shared/tasks/teardown.yml
+      image: bosh-integration-image
+  - task: ensure-terminated
+    file: bosh-aws-cpi-release/ci/tasks/ensure-terminated.yml
+    image: bosh-integration-image
+    input_mapping:
+      environment: e2e-environment
+    params:
+      AWS_ACCESS_KEY_ID: ((aws-admin.username))
+      AWS_SECRET_ACCESS_KEY: ((aws-admin.password))
+      AWS_DEFAULT_REGION: us-west-1
+  - put: e2e-environment
+    params:
+      env_name: bosh-aws-cpi-e2e-local
+      action: destroy
+      env_name_file: e2e-environment/name
+      terraform_source: bosh-aws-cpi-release/ci/assets/terraform
+    get_params:
+      action: destroy
