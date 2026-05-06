@@ -32,7 +32,7 @@ vm_extensions:
 - name: custom_tags_extension
   cloud_properties:
     tags:
-      BoshCPITests: "applied on creation"
+      BoshCPITest: "applied on creation"
 
 compilation:
   reuse_compilation_vms: true
