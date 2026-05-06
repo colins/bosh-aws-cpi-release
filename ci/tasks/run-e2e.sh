@@ -17,16 +17,16 @@ time bosh -n upload-stemcell "$(realpath stemcell/*.tgz)"
 time bosh -n upload-stemcell "$(realpath heavy-stemcell/*.tgz)"
 
 stemcell_name="$( bosh int <( tar xfO $(realpath stemcell/*.tgz) stemcell.MF ) --path /name )"
-# heavy_stemcell_name="$( bosh int <( tar xfO $(realpath heavy-stemcell/*.tgz) stemcell.MF ) --path /name )"
+heavy_stemcell_name="$( bosh int <( tar xfO $(realpath heavy-stemcell/*.tgz) stemcell.MF ) --path /name )"
 
-# time bosh repack-stemcell \
-#   --name e2e-encrypted-heavy-stemcell \
-#   --version 0.1 \
-#   --cloud-properties "{\"encrypted\": true, \"kms_key_arn\": \"${BOSH_AWS_KMS_KEY_ARN}\"}" \
-#   "$(realpath heavy-stemcell/*.tgz)" \
-#   /tmp/e2e-encrypted-heavy-stemcell.tgz
-# time bosh -n upload-stemcell /tmp/e2e-encrypted-heavy-stemcell.tgz
-# encrypted_heavy_stemcell_ami_id="$( bosh stemcells | grep e2e-encrypted-heavy-stemcell | awk '{print $NF;}' )"
+time bosh repack-stemcell \
+  --name e2e-encrypted-heavy-stemcell \
+  --version 0.1 \
+  --cloud-properties "{\"encrypted\": true, \"kms_key_arn\": \"${BOSH_AWS_KMS_KEY_ARN}\"}" \
+  "$(realpath heavy-stemcell/*.tgz)" \
+  /tmp/e2e-encrypted-heavy-stemcell.tgz
+time bosh -n upload-stemcell /tmp/e2e-encrypted-heavy-stemcell.tgz
+encrypted_heavy_stemcell_ami_id="$( bosh stemcells | grep e2e-encrypted-heavy-stemcell | awk '{print $NF;}' )"
 
 # UPDATE CLOUD CONFIG
 time bosh -n ucc \
@@ -34,10 +34,9 @@ time bosh -n ucc \
   bosh-aws-cpi-release/ci/assets/e2e-test-release/cloud-config.yml
 
 # BOSH DEPLOY
-# No comments allowed in bash with slash continuation
-  # -v "heavy_stemcell_name=${heavy_stemcell_name}" \
-  # -v "encrypted_heavy_stemcell_ami_id=${encrypted_heavy_stemcell_ami_id}" \
 time bosh -n deploy -d e2e-test \
+  -v "heavy_stemcell_name=${heavy_stemcell_name}" \
+  -v "encrypted_heavy_stemcell_ami_id=${encrypted_heavy_stemcell_ami_id}" \
   -v "stemcell_name=${stemcell_name}" \
   -v "aws_kms_key_arn=${BOSH_AWS_KMS_KEY_ARN}" \
   -l environment/metadata \
